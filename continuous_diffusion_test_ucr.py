@@ -6,9 +6,9 @@ Created on Tue Nov  1 12:38:47 2022
 """
 
 # models
-from unet_lightning import Unet
-from vdm_lightning import VDM
-#from ..supervised_FCN.supervised_FCN.models import fcn
+from unet_lightning import Unet # Denoising U-Net
+from vdm_lightning import VDM # Variational Diffusion Model
+#from supervised_FCN.models import fcn # Fully Convulational Network
 
 # data
 from preprocess_ucr import DatasetImporterUCR, UCRDataset, SynthethicUCRDataset
@@ -36,11 +36,12 @@ if __name__()=='__main__':
     
     ### data path
     path = Path('C:/Users/marti/OneDrive/Dokumenter/9. semester/Prosjektoppgave/diffusion-time-series')
+    model_folder = 'saved_models'
 
 
     ### import UCR time series data
-    name = 'TwoPatterns'
-    dataset_importer = DatasetImporterUCR(path, name)
+    dataset_name = 'TwoPatterns'
+    dataset_importer = DatasetImporterUCR(path, dataset_name)
     ts_length        = dataset_importer.ts_length
     n_classes        = dataset_importer.n_classes
     le               = dataset_importer.label_encoder
@@ -58,9 +59,9 @@ if __name__()=='__main__':
     unet = Unet(
         ts_length    = ts_length,
         n_classes    = n_classes,
-        dim          = 128,
-        dim_mults    = (1, 2, 4, 6),
-        time_dim     = 128,
+        dim          = 64,
+        dim_mults    = (1, 2, 4, 8),
+        time_dim     = 64,
         class_dim    = 32,
         padding_mode = 'replicate'
     )
@@ -78,13 +79,19 @@ if __name__()=='__main__':
     
     
     ### fit model
+    logger = WandbLogger(
+        name = datetime.now().strftime('%D - %H:%M:%S'),
+        project = dataset_name,
+        save_dir = model_folder
+    )
+    
     trainer = Trainer(
-        default_root_dir='',
+        default_root_dir = path.joinpath(model_folder),
         max_epochs = 2,
         log_every_n_steps = 10,
         accelerator = 'gpu',
         devices = 1,
-        logger = WandbLogger(project=name, name=datetime.now().strftime('%D - %H:%M:%S'))
+        logger = logger
     )
     trainer.fit(diffusion_model, train_loader, val_loader)
     wandb.finish()
@@ -107,7 +114,7 @@ if __name__()=='__main__':
     
     
     ### create synthetic dataset
-    dataset_syn = SynthethicUCRDataset(diffusion_model, dataset_all, sampling_steps=10, guidance_weigth = 1.0)
+    dataset_syn = SynthethicUCRDataset(diffusion_model, train_dataset, sampling_steps=10, guidance_weigth = 1.0)
     
     loader_syn = DataLoader(dataset_syn, batch_size=32, num_workers=0, shuffle=True)
 

@@ -445,14 +445,10 @@ class Unet(pl.LightningModule):
                 class_emb = self.class_emb(y)
             emb = torch.concat((emb, class_emb), dim=1)
         
-        #print(z.shape)
-        #print("Initial block")
         # 1. initial block
         z = self.init_block(z)
         first_skip_connection = z.clone()
         
-        #print("Starting downsampling.")
-        #print(z.shape)
         # 2. down part
         skip_connections = []
         for res_block1, res_block2, attn, downsample in self.downs:
@@ -462,25 +458,15 @@ class Unet(pl.LightningModule):
             z = attn(z)
             skip_connections.append(z)
             z = downsample(z)
-            #print(z.shape)
-        
-        #print('Finished downsampling.')
-        #print(z.shape)
         
         # 3. bottleneck
         z = self.mid_block1(z, emb)
         z = self.mid_attn(z)
         z = self.mid_block2(z, emb)
         
-        #print('Finished bottleneck.')
-        #print(z.shape)
-        
-        #print('Starting upsampling.')
         # 4. up part
         for upsample, res_block1, res_block2, attn in self.ups:
-            #print("z", z.shape)
             z = upsample(z)
-            #print("z (upsampled)", z.shape)
             z = torch.cat((z, skip_connections.pop()), dim=1)
             z = res_block1(z, emb)
             z = torch.cat((z, skip_connections.pop()), dim=1)
