@@ -14,18 +14,13 @@ Created on Tue Nov  8 14:17:20 2022
 
 import math
 from functools import partial
-import numpy as np
 
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from torch.optim import Adam
 
 from einops import rearrange, reduce
-from tqdm import tqdm
-
-from math import pi, prod
 
 
 # --- Utility functions ---
@@ -56,19 +51,39 @@ class Residual(nn.Module):
         return self.fn(x, *args, **kwargs) + x
 
 
+class Interpolate(nn.Module):
+    def __init__(self, size, mode):
+        super(Interpolate, self).__init__()
+        self.interp = nn.functional.interpolate
+        self.size = size
+        self.mode = mode
+        
+    def forward(self, x):
+        x = self.interp(x, size=self.size, mode=self.mode, align_corners=False)
+        return x
 
 
-def Upsample(dim, dim_out=None):
-    return nn.Sequential(
-        nn.Upsample(scale_factor=2, mode='nearest'),
-        nn.Conv1d(dim, default(dim_out, dim), 3, padding=1)
-    )
+# --- Down-/Upsampler ---
+    
+def Downsample(dim, dim_out=None, size_in=None, size_out=None):
+    return nn.Conv1d(dim, default(dim_out, dim), kernel_size=4, stride=2, padding=1)
 
 
-
-
-def Downsample(dim, dim_out = None):
-    return nn.Conv1d(dim, default(dim_out, dim), 4, 2, 1)
+def Upsample(dim, dim_out=None, size_in=None, size_out=None):
+    if exists(size_in) and exists(size_out) and size_out != 2*size_in:
+        # upsampling plus interpolation
+        return nn.Sequential(
+            nn.Upsample(scale_factor=4, mode='nearest'),
+            Interpolate(size=size_out, mode='linear'),
+            nn.Conv1d(dim, default(dim_out, dim), kernel_size=3, padding=1)
+        )
+    else:
+        # normal upsampling
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv1d(dim, default(dim_out, dim), kernel_size=3, padding=1)
+        )
+    
 
 
 
@@ -87,6 +102,28 @@ class WeightStandardizedConv1d(nn.Conv1d):
         normalized_weight = (weight - mean) * (var + eps).rsqrt()
 
         return F.conv1d(x, normalized_weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
+
+class BLUP_Conv1d(nn.Conv1d):
+    """
+    Adding the optional padding mode "extrapolate".
+    NB! Only works for padding=1.
+    
+    This fixes end-point issues.
+    """
+    
+    def forward(self, x):
+        # BLUP for x_0 and x_{n+1}
+        pred_start = 2*x[:,:,[0]] - x[:,:,[1]]
+        pred_end   = 2*x[:,:,[-1]] - x[:,:,[-2]]
+        
+        # concatenate the estimations on the endpoints along the length dimension
+        # dim 0 is batch, dim 1 is channels
+        x = torch.cat((pred_start, x, pred_end), dim=2)
+        
+        # normal convolution on the inner part
+        return F.conv1d(x, self.weight, self.bias, self.stride, 0, self.dilation, self.groups)
 
 
 
@@ -151,7 +188,7 @@ class LearnedSinusoidalPosEmb(nn.Module):
     def forward(self, x):
         x = rearrange(x, 'b -> b 1')
         freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
-        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         fouriered = torch.cat((x, fouriered), dim = -1)
         
         return fouriered
@@ -162,9 +199,9 @@ class LearnedSinusoidalPosEmb(nn.Module):
 ### Building block modules
 
 class Block(nn.Module):
-    def __init__(self, dim, dim_out, groups=8):
+    def __init__(self, dim, dim_out, groups=8, padding_mode='replicate'):
         super().__init__()
-        self.proj = WeightStandardizedConv1d(dim, dim_out, kernel_size=3, padding=1)
+        self.proj = WeightStandardizedConv1d(dim, dim_out, kernel_size=3, padding=1, padding_mode=padding_mode)
         self.group_norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.PReLU()
 
@@ -172,7 +209,7 @@ class Block(nn.Module):
         x = self.proj(x)
         x = self.group_norm(x)
         
-        # adaptive GroupNorm
+        # adaptive Group Normalization
         if exists(scale_shift):
             scale, shift = scale_shift
             x = x * (scale + 1) + shift
@@ -185,15 +222,15 @@ class Block(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, dim, dim_out, *, emb_dim=None, groups=8):
+    def __init__(self, dim, dim_out, *, emb_dim=None, groups=8, padding_mode='replicate'):
         super().__init__()
         self.embedder = nn.Sequential(
             nn.PReLU(),
             nn.Linear(emb_dim, dim_out*2)
         ) if exists(emb_dim) else None
 
-        self.block1 = Block(dim, dim_out, groups=groups)
-        self.block2 = Block(dim_out, dim_out, groups=groups)
+        self.block1 = Block(dim, dim_out, groups=groups, padding_mode=padding_mode)
+        self.block2 = Block(dim_out, dim_out, groups=groups, padding_mode=padding_mode)
         self.res_conv = nn.Conv1d(dim, dim_out, kernel_size=1) if dim != dim_out else nn.Identity()
 
 
@@ -280,35 +317,49 @@ class Attention(nn.Module):
 class Unet(pl.LightningModule):
     def __init__(
         self,
-        dim,
-        dim_mults=(1, 2, 4),
-        channels = 1,
-        out_channels = None,
+        ts_length,
         n_classes = 1,
+        dim = 64,
+        dim_mults = (1, 2, 4),
+        in_channels = 1,
+        out_channels = None,
         resnet_block_groups = 8,
         learned_sinusoidal_cond = False,
         learned_sinusoidal_dim = 16,
-        class_dim = 64,
-        time_dim = 64
+        class_dim = 16,
+        time_dim = 16,
+        padding_mode = 'replicate'
     ):
         super().__init__()
-
-        # number of in/out channels
-        self.channels = channels
-        self.out_channels = default(out_channels, channels)
-        self.n_classes    = n_classes
-        self.uncond_class = n_classes
         
-        # dimensions
+        # length of time series
+        self.ts_length = ts_length
+        
+        # number of in/out channels
+        self.in_channels  = in_channels
+        self.out_channels = default(out_channels, in_channels)
+        
+        # number of classes
+        self.n_classes    = int(n_classes)
+        
+        # dimensions (number of channels) and sizes of each layer
         self.dims = [dim] + [dim*m for m in dim_mults]
         self.mid_dim = self.dims[-1]
         
+        self.sizes = [self.ts_length]
+        for _ in dim_mults:
+            self.sizes.append(self.sizes[-1] // 2)
+        
+        
         # time/class embedding dimensions
         self.time_dim = time_dim
-        self.class_conditional = (self.n_classes > 1)
+        self.class_conditional = True if self.n_classes > 1 else False
         self.class_dim = class_dim if self.class_conditional else 0
         self.emb_dim = self.time_dim + self.class_dim
         
+        # padding mode
+        self.padding_mode = padding_mode
+
 
         # --- time embeddings ---
         self.learned_sinusoidal_cond = learned_sinusoidal_cond
@@ -336,39 +387,35 @@ class Unet(pl.LightningModule):
         # --- layers ---
         
         # initial layer        
-        self.init_block = nn.Conv1d(channels, dim, kernel_size=7, padding=3)
+        self.init_block = nn.Conv1d(in_channels, dim, kernel_size=7, padding=3, padding_mode=self.padding_mode)
         
         # partially defined Resnet block
-        resnet_block = partial(ResnetBlock, emb_dim=self.emb_dim, groups=resnet_block_groups)
-        # in/out dim for each down/up layer
-        in_out = list(zip(self.dims[:-1], self.dims[1:]))
+        resnet_block = partial(ResnetBlock, emb_dim=self.emb_dim, groups=resnet_block_groups, padding_mode=self.padding_mode)
+        
+        # in/out dim and sizes for each down/up layer
+        in_out = list(zip(self.dims[:-1], self.dims[1:], self.sizes[:-1], self.sizes[1:]))
         
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-        num_resolutions = len(in_out)
 
-        for ind, (dim_in, dim_out) in enumerate(in_out):
-            is_last = (ind >= num_resolutions - 1)
-
+        for dim_in, dim_out, size_in, size_out in in_out:
             self.downs.append(nn.ModuleList([
                 resnet_block(dim_in, dim_in),
                 resnet_block(dim_in, dim_in),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
-                Downsample(dim_in, dim_out) if not is_last else nn.Conv1d(dim_in, dim_out, kernel_size=3, padding = 1)
+                Downsample(dim_in, dim_out)
             ]))
 
         self.mid_block1 = resnet_block(self.mid_dim, self.mid_dim)
         self.mid_attn = Residual(PreNorm(self.mid_dim, Attention(self.mid_dim)))
         self.mid_block2 = resnet_block(self.mid_dim, self.mid_dim)
 
-        for idx, (dim_in, dim_out) in enumerate(reversed(in_out)):
-            is_last = idx == (len(in_out) - 1)
-
+        for dim_out, dim_in, size_out, size_in in reversed(in_out):
             self.ups.append(nn.ModuleList([
-                resnet_block(dim_out + dim_in, dim_out),
-                resnet_block(dim_out + dim_in, dim_out),
-                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
-                Upsample(dim_out, dim_in) if not is_last else  nn.Conv1d(dim_out, dim_in, kernel_size=3, padding = 1)
+                Upsample(dim_in, dim_out, size_in, size_out),
+                resnet_block(dim_out*2, dim_out),
+                resnet_block(dim_out*2, dim_out),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out)))
             ]))
 
         self.final_res_block = resnet_block(dim*2, dim)
@@ -393,15 +440,19 @@ class Unet(pl.LightningModule):
                 y = y.type(torch.int32)
                 class_emb = self.class_emb(y)
             else:
-                y = torch.Tensor([self.uncond_class]).type(torch.int32)
+                y = torch.Tensor([self.n_classes]).type(torch.int32)
                 y = y.repeat(z.shape[0]).to(self.device)
                 class_emb = self.class_emb(y)
             emb = torch.concat((emb, class_emb), dim=1)
         
+        #print(z.shape)
+        #print("Initial block")
         # 1. initial block
         z = self.init_block(z)
         first_skip_connection = z.clone()
-                
+        
+        #print("Starting downsampling.")
+        #print(z.shape)
         # 2. down part
         skip_connections = []
         for res_block1, res_block2, attn, downsample in self.downs:
@@ -411,20 +462,30 @@ class Unet(pl.LightningModule):
             z = attn(z)
             skip_connections.append(z)
             z = downsample(z)
+            #print(z.shape)
+        
+        #print('Finished downsampling.')
+        #print(z.shape)
         
         # 3. bottleneck
         z = self.mid_block1(z, emb)
         z = self.mid_attn(z)
         z = self.mid_block2(z, emb)
         
+        #print('Finished bottleneck.')
+        #print(z.shape)
+        
+        #print('Starting upsampling.')
         # 4. up part
-        for res_block1, res_block2, attn, upsample in self.ups:
+        for upsample, res_block1, res_block2, attn in self.ups:
+            #print("z", z.shape)
+            z = upsample(z)
+            #print("z (upsampled)", z.shape)
             z = torch.cat((z, skip_connections.pop()), dim=1)
             z = res_block1(z, emb)
             z = torch.cat((z, skip_connections.pop()), dim=1)
             z = res_block2(z, emb)
             z = attn(z)
-            z = upsample(z)
         
         # 5. final block
         z = torch.cat((z, first_skip_connection), dim=1)

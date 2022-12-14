@@ -8,9 +8,10 @@ Created on Tue Nov  1 12:38:47 2022
 # models
 from unet_lightning import Unet
 from vdm_lightning import VDM
+#from ..supervised_FCN.supervised_FCN.models import fcn
 
 # data
-from preprocess_ucr import DatasetImporterUCR, UCRDataset
+from preprocess_ucr import DatasetImporterUCR, UCRDataset, SynthethicUCRDataset
 
 # metrics
 from metrics import calculate_fid
@@ -28,94 +29,103 @@ from pathlib import Path
 
 # plotting
 import matplotlib.pyplot as plt
-
+from plot import nice_plot
 
 
 if __name__()=='__main__':
-    ### import UCR time series data
-    dataset = 'Wafer'
-    batch_size = 64
-    cwdir = Path('C:/Users/marti/OneDrive/Dokumenter/9. semester/Prosjektoppgave/diffusion-time-series')
+    
+    ### data path
+    path = Path('C:/Users/marti/OneDrive/Dokumenter/9. semester/Prosjektoppgave/diffusion-time-series')
 
-    # data pipeline
-    dataset_importer = DatasetImporterUCR(cwdir, dataset, data_scaling=True)
+
+    ### import UCR time series data
+    name = 'TwoPatterns'
+    dataset_importer = DatasetImporterUCR(path, name)
+    ts_length        = dataset_importer.ts_length
+    n_classes        = dataset_importer.n_classes
+    le               = dataset_importer.label_encoder
+    enc_dec          = dataset_importer.standard_scaler
     
-    # train and test set combined
-    dataset_all   = UCRDataset("train/test", dataset_importer)
-    loader_all    = DataLoader(dataset_all, batch_size, num_workers=0, shuffle=True)
-    loader_val    = DataLoader(dataset_all, batch_size, num_workers=0, shuffle=False)
     
-    # time series length and number of classes
-    ts_length = dataset_importer.X_train.shape[2]
-    n_classes = torch.unique(dataset_importer.Y_train).shape[0]
-    
+    ### data loader
+    batch_size  = 32
+    train_dataset = UCRDataset("train", dataset_importer)
+    train_loader  = DataLoader(train_dataset, batch_size, num_workers=0, shuffle=True)
+    val_dataset = UCRDataset("test", dataset_importer)
+    val_loader  = DataLoader(val_dataset, batch_size, num_workers=0, shuffle=False)
     
     ### unet model
     unet = Unet(
-        dim       = ts_length,
-        dim_mults = (1, 2, 4),
-        n_classes = 2,
+        ts_length    = ts_length,
+        n_classes    = n_classes,
+        dim          = 128,
+        dim_mults    = (1, 2, 4, 6),
+        time_dim     = 128,
+        class_dim    = 32,
+        padding_mode = 'replicate'
     )
     
-    # test that the unet model works
-    sample = dataset_importer.X_train[[0, 1, 0]]
-    t = torch.Tensor([0.5, 0.6, 0.7])
-    y = torch.Tensor([0, 1, 0]).type(torch.int32)
-    
-    # test conditional / unconditional unet progression
-    unet(sample, t, None).shape
-    unet(sample, t, y).shape
     
     ### diffusion model
     diffusion_model = VDM(
         unet,
-        ts_length,
         loss_type  = 'l2',
         objective  = 'pred_noise',
-        schedule   = 'cosine',
         train_lr   = 1e-5,
         adam_betas = (0.9, 0.99),
-        cond_drop  = 0.1,
-        quasi_rand = True
+        cond_drop  = 0.1
     )
-
-
-    # test conditional / unconditional vdm progression loss    
-    diffusion_model.p_losses(sample, t, condition=y, noise=None)
-
+    
     
     ### fit model
     trainer = Trainer(
-        max_epochs = 10,
+        default_root_dir='',
+        max_epochs = 2,
         log_every_n_steps = 10,
         accelerator = 'gpu',
         devices = 1,
-        logger = WandbLogger(project=dataset, name=datetime.now().strftime('%D - %H:%M:%S'))
+        logger = WandbLogger(project=name, name=datetime.now().strftime('%D - %H:%M:%S'))
     )
-    trainer.fit(diffusion_model, loader_all, loader_all)
+    trainer.fit(diffusion_model, train_loader, val_loader)
     wandb.finish()
     
     
-    ### uncoditional sampling of new data
-    n_samples = 10
+    ### sampling of new data
+    n_samples = 7
     sampling_steps = 30
+    condition = torch.Tensor([0,1,0,0,0,1,1]).type(torch.int32)
+    guidance_strength = 2.0
     
-    samples = diffusion_model.sample(n_samples, sampling_steps)
+    samples     = diffusion_model.sample(n_samples, sampling_steps, condition, guidance_strength)
+    unc_samples = diffusion_model.sample(n_samples, sampling_steps, None)
     
     # plot generated samples
-    for i in range(10):plt.plot(samples[i, 0, :].cpu())
+    nice_plot(samples, condition)
     
-    # plot ground truth (for reference)
-    for i in range(10):plt.plot(dataset_all.X[i,0,:].cpu())
+    for i in range(n_samples):
+        nice_plot(samples[[i],:,:], condition[[i]])
     
     
-    ### conditional sampling of new data
-    n_samples = 10
-    sampling_steps = 30
+    ### create synthetic dataset
+    dataset_syn = SynthethicUCRDataset(diffusion_model, dataset_all, sampling_steps=10, guidance_weigth = 1.0)
     
-    samples = diffusion_model.sample(n_samples, sampling_steps, condition=torch.Tensor([1,1,1,1,1,1,1,1,1,1]).type(torch.int32), guidance_weight=2.0)
+    loader_syn = DataLoader(dataset_syn, batch_size=32, num_workers=0, shuffle=True)
+
+    # get a mini-batch of samples
+    for batch in loader_syn:
+        x, y = batch
+        break
+
+    # plot
+    n_samples = 5
+    c = 0
+    fig, axes = plt.subplots(n_samples, 1, figsize=(3.5, 1.7*n_samples))
+    for i, ax in enumerate(axes):
+        ax.plot(x[i, c])
+    plt.tight_layout()
+    plt.show()    
     
-    samples = diffusion_model.sample(n_samples, sampling_steps, condition=torch.Tensor([0,0,0,0,0,0,0,0,0,0]).type(torch.int32), guidance_weight=2.0)
+    
     
     
     ### calculate FID score
@@ -124,7 +134,18 @@ if __name__()=='__main__':
     # X_tilde: generated samples
     
     X = torch.concat((dataset_importer.X_train, dataset_importer.X_test)).reshape(-1, ts_length)
-    X_tilde = samples.reshape(-1, ts_length)
+    X_tilde = unc_samples.reshape(-1, ts_length)
+    
+    fid = calculate_fid(X_tilde, X)
+    print('FID score is {}.'.format(round(float(fid),4)))
+    
+    # suspecting that the FID gives me too high results
+    # try clipping the samples.
+    unc_samples_clipped = torch.clip(unc_samples, min=-0.7, max=0.7)
+    for i in range(10):plt.plot(unc_samples_clipped[i, 0, :].cpu())
+    
+    X = torch.concat((dataset_importer.X_train, dataset_importer.X_test)).reshape(-1, ts_length)
+    X_tilde = unc_samples_clipped.reshape(-1, ts_length)
     
     fid = calculate_fid(X_tilde, X)
     print('FID score is {}.'.format(round(float(fid),4)))
@@ -132,10 +153,7 @@ if __name__()=='__main__':
     
     
     
-    
-    
-    
-    ### old test that the diffusion model works!
+    ### old tests that the diffusion model works!
     '''
     
     def plot_samples(samples):

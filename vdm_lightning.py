@@ -70,32 +70,27 @@ class VDM(pl.LightningModule):
     def __init__(
         self,
         model:Unet,
-        ts_length:int,
         loss_type:str    = 'l2',
         objective:str    = 'pred_noise',
-        schedule:str     = 'cosine',
         train_lr:float   = 1e-5,
         adam_betas:tuple = (0.9, 0.99),
         cond_drop:float  = 0.1,
-        quasi_rand:bool  = False
+        quasi_rand:bool  = True
     ):
         super().__init__()
         
         # --- assert inputs ---
-        
-        assert not (type(self) == VDM and model.channels != model.out_channels), 'wrong number of channels in model'
-        assert type(ts_length) == int, 'ts_length must be an integer'
+        assert not (type(self) == VDM and model.in_channels != model.out_channels), 'wrong number of channels in model'
+        assert type(model.ts_length) == int, 'ts_length must be an integer'
         assert loss_type in {'l1', 'l2'}, 'loss_type must be either l1 or l2'
-        assert objective in {'pred_noise', 'pred_x', 'pred_s', 'pred_v'}, f'objective {objective} is not supported'
-        assert schedule in {'cosine'}, 'variance schedule must be cosine'
+        assert objective in {'pred_noise', 'pred_x', 'pred_v'}, f'objective {objective} is not supported'
         
         # --- architecture ---
         self.model          = model                            # Unet model
-        self.channels       = self.model.channels              # number of channels
-        self.ts_length      = ts_length                        # time series length
+        self.channels       = model.in_channels                # number of input channels
+        self.ts_length      = model.ts_length                  # time series length
         self.loss_type      = loss_type                        # loss type
         self.objective      = objective                        # prediction objective
-        self.schedule       = schedule                         # signal-to-noise schedule
         self.train_lr       = train_lr                         # learning rate
         self.adam_betas     = adam_betas                       # adam parameters
         self.cond_drop      = cond_drop                        # conditional dorpout parameter
@@ -106,6 +101,7 @@ class VDM(pl.LightningModule):
     
     
     # --- Variance schedule ---
+    
     def alpha(self, t):
         return self.schedule_scale + (1-2*self.schedule_scale) * torch.cos(t * pi/2)
     
@@ -114,7 +110,7 @@ class VDM(pl.LightningModule):
         
     
     
-    # --- Forward process given the Markovian process q ---
+    # --- Forward Markovian diffusion process q ---
     
     def q_sample(self, x, t=None, noise=None):
         """
@@ -286,7 +282,7 @@ class VDM(pl.LightningModule):
         # sample x from a previous time step
         pred_z = model_mean + model_variance * eps
         
-        # Z-normalize the variance
+        # Z-normalize the variance, but not the mean
         pred_z /= torch.std(pred_z)
         
         return pred_z, pred_x
@@ -300,8 +296,6 @@ class VDM(pl.LightningModule):
         
         # time discretization
         tau = torch.linspace(1, 0, sampling_steps+1, device=self.device).view(-1,1)
-        
-        # conditional sampling
         
         
         # sample from prior N(0, I)
@@ -325,7 +319,7 @@ class VDM(pl.LightningModule):
         # batch_size, n_channels, ts_length
         b, c, l = x.shape
         
-        # (quasi)random times
+        # random time
         if self.quasi_rand:    
             t = default(t, lambda: quasi_rand((b), device=self.device))
         else:
@@ -344,7 +338,7 @@ class VDM(pl.LightningModule):
             pred = self.model(z_t, t, condition)
         
         
-        # target and weight
+        # target
         if self.objective == 'pred_noise':
             target = noise
         elif self.objective == 'pred_x':
@@ -353,23 +347,25 @@ class VDM(pl.LightningModule):
             raise ValueError('unknown objective!')
         
         
+        # calculate loss
         loss = self.loss_fn(pred, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         
         return loss.mean()
-    
-    
-    def forward(self, x, *args, **kwargs):
-        print('This is not how the diffusion model should be used! Use the sample function instead.')
-        
-        return x
-    
+
     
     # --- Overwriting PyTorch Lightning in-build methods ---
     
+    def forward(self, x, *args, **kwargs):
+        print('This is not how the variational diffusion model should be used! \
+               Use the sample method instead!')
+        
+        return x
+        
+    
     def training_step(self, batch, batch_idx):
         X, Y = batch
-        Y = Y.flatten() # nescessary
+        Y = Y.flatten() # nescessary if Y is 2D
         
         t = torch.rand([X.shape[0]], device=self.device)
         loss = self.p_losses(X, t, Y)
@@ -380,7 +376,7 @@ class VDM(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         X, Y = batch
-        Y = Y.flatten() # nescessary
+        Y = Y.flatten() # nescessary if Y is 2D
         
         t = torch.rand([X.shape[0]], device=self.device)
         val_loss = self.p_losses(X, t, Y)
